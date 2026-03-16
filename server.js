@@ -80,6 +80,27 @@ const normalizeMovies = (movies) => {
     return Array.from(deduped.values()).slice(0, 5);
 };
 
+const detachSocketFromCurrentSession = (socket) => {
+    const { code, role } = socket.meta || {};
+    if (!code || !role) return;
+
+    const session = sessions.get(code);
+    if (!session) return;
+
+    if (role === "a" && session.players.a === socket) {
+        session.players.a = null;
+    }
+    if (role === "b" && session.players.b === socket) {
+        session.players.b = null;
+    }
+
+    if (!session.players.a && !session.players.b) {
+        sessions.delete(code);
+    } else {
+        broadcastState(session);
+    }
+};
+
 const server = http.createServer((req, res) => {
     if (req.url === "/health") {
         res.writeHead(200, { "content-type": "application/json" });
@@ -108,6 +129,7 @@ wss.on("connection", (socket) => {
         const { type, payload = {} } = message;
 
         if (type === "create_session") {
+            detachSocketFromCurrentSession(socket);
             const code = createCode();
             const session = {
                 code,
@@ -130,6 +152,7 @@ wss.on("connection", (socket) => {
         }
 
         if (type === "join_session") {
+            detachSocketFromCurrentSession(socket);
             const code = String(payload.code || "").trim().toUpperCase();
             const session = sessions.get(code);
 
