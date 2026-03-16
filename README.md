@@ -1,14 +1,14 @@
-# WSE Watch Match Server
+# Watch Match Server
 
 Standalone WebSocket backend for the Watch Match feature.
 
 ## Features
-- Creates and joins 2-player sessions
+- Create and join 2-player sessions
 - Each player submits 5 picks
-- Random synchronized movie voting
+- Random shared voting flow
 - Match on `yes + yes`
-- Next movie on non-match
-- In-memory session state (MVP)
+- Built-in chat (`send_chat_message`, `chat_message`, `chat_history`)
+- Health endpoint: `GET /health`
 
 ## Local Run
 ```bash
@@ -17,25 +17,15 @@ npm install
 npm start
 ```
 
-Server runs on `PORT` (default `3001`).
+Default port: `3001`
 
-## Health Check
-- `GET /health` returns `{ "ok": true }`
+## Render Deployment (Free)
+1. Push this folder as a separate GitHub repo.
+2. Create a Render **Web Service**.
+3. Build command: `npm install`
+4. Start command: `npm start`
+5. Health check path: `/health`
 
-## WebSocket URL
-- Local: `ws://localhost:3001`
-- Render: `wss://<your-service>.onrender.com`
+After deploy, use in app:
 
-## Render Deploy
-1. Push `watch-match-server` as a separate GitHub repo.
-2. Create a new **Web Service** on Render.
-3. Use:
-   - Build Command: `npm install`
-   - Start Command: `npm start`
-   - Node: `>=18`
-4. After deploy, copy your public URL and set in app:
-   - `VITE_WATCH_MATCH_SOCKET_URL=wss://<your-service>.onrender.com`
-
-## Notes
-- This MVP stores everything in memory.
-- For production, move sessions to Redis/Postgres and add auth.
+`VITE_WATCH_MATCH_SOCKET_URL=wss://<your-service>.onrender.com`

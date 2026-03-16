@@ -3,12 +3,12 @@ const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
 
 const PORT = Number(process.env.PORT || 3001);
-
 const sessions = new Map();
 
 const createCode = () => crypto.randomBytes(3).toString("hex").toUpperCase();
+const createMessageId = () => crypto.randomBytes(8).toString("hex");
 
-const safeSend = (socket, type, payload = {}) => {
+const send = (socket, type, payload = {}) => {
     if (!socket || socket.readyState !== socket.OPEN) return;
     socket.send(JSON.stringify({ type, payload }));
 };
@@ -29,26 +29,22 @@ const getSessionState = (session) => ({
 });
 
 const broadcastState = (session) => {
-    const statePayload = getSessionState(session);
-    safeSend(session.players.a, "session_state", statePayload);
-    safeSend(session.players.b, "session_state", statePayload);
+    const payload = getSessionState(session);
+    send(session.players.a, "session_state", payload);
+    send(session.players.b, "session_state", payload);
 };
 
-const getMoviePool = (session) => {
+const getPool = (session) => {
     const deduped = new Map();
-
     [...session.picks.a, ...session.picks.b].forEach((movie) => {
-        if (!deduped.has(movie.ID)) {
-            deduped.set(movie.ID, movie);
-        }
+        if (!deduped.has(movie.ID)) deduped.set(movie.ID, movie);
     });
 
     return Array.from(deduped.values()).filter((movie) => !session.seenMovieIds.has(movie.ID));
 };
 
-const setNextMovie = (session) => {
-    const pool = getMoviePool(session);
-
+const nextMovie = (session) => {
+    const pool = getPool(session);
     if (!pool.length) {
         session.phase = "finished_no_match";
         session.currentMovie = null;
@@ -63,7 +59,6 @@ const setNextMovie = (session) => {
 
 const normalizeMovies = (movies) => {
     const deduped = new Map();
-
     (Array.isArray(movies) ? movies : []).forEach((movie) => {
         const id = Number(movie?.ID);
         const title = String(movie?.Title || "").trim();
@@ -72,8 +67,8 @@ const normalizeMovies = (movies) => {
         deduped.set(id, {
             ID: id,
             Title: title,
-            PosterUrl: movie?.PosterUrl ? String(movie.PosterUrl) : undefined,
-            Year: movie?.Year,
+            PosterUrl: movie?.PosterUrl || undefined,
+            Year: movie?.Year || undefined,
         });
     });
 
@@ -88,7 +83,7 @@ const server = http.createServer((req, res) => {
     }
 
     res.writeHead(200, { "content-type": "text/plain" });
-    res.end("Watch Match websocket server is running.");
+    res.end("watch-match-server running");
 });
 
 const wss = new WebSocketServer({ server });
@@ -98,11 +93,10 @@ wss.on("connection", (socket) => {
 
     socket.on("message", (raw) => {
         let message;
-
         try {
             message = JSON.parse(String(raw));
         } catch {
-            safeSend(socket, "session_error", { message: "Invalid payload" });
+            send(socket, "session_error", { message: "Invalid payload" });
             return;
         }
 
@@ -119,11 +113,13 @@ wss.on("connection", (socket) => {
                 currentMovie: null,
                 matchedMovie: null,
                 seenMovieIds: new Set(),
+                chatMessages: [],
             };
 
             sessions.set(code, session);
             socket.meta = { code, role: "a" };
-            safeSend(socket, "session_created", { code, role: "a" });
+            send(socket, "session_created", { code, role: "a" });
+            send(socket, "chat_history", session.chatMessages);
             broadcastState(session);
             return;
         }
@@ -133,23 +129,23 @@ wss.on("connection", (socket) => {
             const session = sessions.get(code);
 
             if (!session) {
-                safeSend(socket, "session_error", { message: "Session not found" });
+                send(socket, "session_error", { message: "Session not found" });
                 return;
             }
 
             if (session.players.b) {
-                safeSend(socket, "session_error", { message: "Session is full" });
+                send(socket, "session_error", { message: "Session is full" });
                 return;
             }
 
             session.players.b = socket;
             socket.meta = { code, role: "b" };
-
             if (session.phase === "waiting_for_second_user") {
                 session.phase = "picking";
             }
 
-            safeSend(socket, "session_joined", { code, role: "b" });
+            send(socket, "session_joined", { code, role: "b" });
+            send(socket, "chat_history", session.chatMessages);
             broadcastState(session);
             return;
         }
@@ -164,7 +160,7 @@ wss.on("connection", (socket) => {
             session.picks[role] = normalizeMovies(payload.movies);
 
             if (session.picks.a.length === 5 && session.picks.b.length === 5) {
-                setNextMovie(session);
+                nextMovie(session);
             } else {
                 session.phase = "picking";
             }
@@ -193,11 +189,37 @@ wss.on("connection", (socket) => {
                     if (session.currentMovie?.ID) {
                         session.seenMovieIds.add(session.currentMovie.ID);
                     }
-                    setNextMovie(session);
+                    nextMovie(session);
                 }
             }
 
             broadcastState(session);
+            return;
+        }
+
+        if (type === "send_chat_message") {
+            const code = String(payload.code || "").trim().toUpperCase();
+            const role = payload.role;
+            const text = String(payload.text || "").trim();
+            const session = sessions.get(code);
+
+            if (!session || (role !== "a" && role !== "b")) return;
+            if (!text) return;
+
+            const chatMessage = {
+                id: createMessageId(),
+                role,
+                text: text.slice(0, 1000),
+                createdAt: new Date().toISOString(),
+            };
+
+            session.chatMessages.push(chatMessage);
+            if (session.chatMessages.length > 100) {
+                session.chatMessages.shift();
+            }
+
+            send(session.players.a, "chat_message", chatMessage);
+            send(session.players.b, "chat_message", chatMessage);
         }
     });
 
