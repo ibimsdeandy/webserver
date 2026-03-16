@@ -7,6 +7,7 @@ const sessions = new Map();
 
 const createCode = () => crypto.randomBytes(3).toString("hex").toUpperCase();
 const createMessageId = () => crypto.randomBytes(8).toString("hex");
+const toVoteLabel = (vote) => (vote === "yes" ? "Ja" : "Nein");
 
 const send = (socket, type, payload = {}) => {
     if (!socket || socket.readyState !== socket.OPEN) return;
@@ -36,6 +37,23 @@ const broadcastState = (session) => {
     const payload = getSessionState(session);
     send(session.players.a, "session_state", payload);
     send(session.players.b, "session_state", payload);
+};
+
+const createChatMessage = (role, text) => ({
+    id: createMessageId(),
+    role,
+    text: text.slice(0, 1000),
+    createdAt: new Date().toISOString(),
+});
+
+const pushChatMessage = (session, message) => {
+    session.chatMessages.push(message);
+    if (session.chatMessages.length > 100) {
+        session.chatMessages.shift();
+    }
+
+    send(session.players.a, "chat_message", message);
+    send(session.players.b, "chat_message", message);
 };
 
 const getPool = (session) => {
@@ -210,15 +228,33 @@ wss.on("connection", (socket) => {
             session.votes[role] = vote;
 
             if (session.votes.a && session.votes.b) {
+                const currentTitle = session.currentMovie?.Title || "Unbekannter Titel";
+                const voteA = session.votes.a;
+                const voteB = session.votes.b;
+                let outcomeText;
+
                 if (session.votes.a === "yes" && session.votes.b === "yes") {
                     session.phase = "matched";
                     session.matchedMovie = session.currentMovie;
+                    outcomeText = "Match!";
                 } else {
                     if (session.currentMovie?.ID) {
                         session.seenMovieIds.add(session.currentMovie.ID);
                     }
                     nextMovie(session);
+
+                    outcomeText = session.phase === "finished_no_match"
+                        ? "Kein Match und keine weiteren Titel verfügbar."
+                        : "Kein Match, nächster Titel wird geladen.";
                 }
+
+                pushChatMessage(
+                    session,
+                    createChatMessage(
+                        "system",
+                        `Abstimmung zu "${currentTitle}": A ${toVoteLabel(voteA)}, B ${toVoteLabel(voteB)}. ${outcomeText}`
+                    )
+                );
             }
 
             broadcastState(session);
@@ -234,20 +270,7 @@ wss.on("connection", (socket) => {
             if (!session || (role !== "a" && role !== "b")) return;
             if (!text) return;
 
-            const chatMessage = {
-                id: createMessageId(),
-                role,
-                text: text.slice(0, 1000),
-                createdAt: new Date().toISOString(),
-            };
-
-            session.chatMessages.push(chatMessage);
-            if (session.chatMessages.length > 100) {
-                session.chatMessages.shift();
-            }
-
-            send(session.players.a, "chat_message", chatMessage);
-            send(session.players.b, "chat_message", chatMessage);
+            pushChatMessage(session, createChatMessage(role, text));
         }
     });
 
