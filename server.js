@@ -26,6 +26,10 @@ const getSessionState = (session) => ({
         a: Boolean(session.players.a),
         b: Boolean(session.players.b),
     },
+    votesDone: {
+        a: Boolean(session.votes.a),
+        b: Boolean(session.votes.b),
+    },
 });
 
 const broadcastState = (session) => {
@@ -68,6 +72,7 @@ const normalizeMovies = (movies) => {
             ID: id,
             Title: title,
             PosterUrl: movie?.PosterUrl || undefined,
+            Character: movie?.Character || undefined,
             Year: movie?.Year || undefined,
         });
     });
