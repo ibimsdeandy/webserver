@@ -21,6 +21,11 @@ const getSessionState = (session) => ({
     phase: session.phase,
     currentMovie: session.currentMovie,
     matchedMovie: session.matchedMovie,
+    moviePool: [...session.picks.a, ...session.picks.b]
+        .reduce((acc, movie) => {
+            if (!acc.some((item) => item.ID === movie.ID)) acc.push(movie);
+            return acc;
+        }, []),
     picksDone: {
         a: session.picks.a.length === 5,
         b: session.picks.b.length === 5,
