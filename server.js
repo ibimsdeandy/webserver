@@ -67,17 +67,11 @@ const getPool = (session) => {
     return Array.from(deduped.values()).filter((movie) => !session.seenMovieIds.has(movie.ID));
 };
 
-const nextMovie = (session, canFinishNoMatch = true) => {
+const nextMovie = (session) => {
     const pool = getPool(session);
     if (!pool.length) {
-        if (canFinishNoMatch) {
-            session.phase = "finished_no_match";
-        } else {
-            const bothUsersConnected = Boolean(session.players.a && session.players.b);
-            session.phase = bothUsersConnected ? "picking" : "waiting_for_second_user";
-        }
+        session.phase = "finished_no_match";
         session.currentMovie = null;
-        session.votes = { a: null, b: null };
         return;
     }
 
@@ -217,18 +211,11 @@ wss.on("connection", (socket) => {
             if (!session || (role !== "a" && role !== "b")) return;
 
             session.picks[role] = normalizeMovies(payload.movies);
-            const bothUsersConnected = Boolean(session.players.a && session.players.b);
-            const bothPicksSubmitted = session.picks.a.length === 5 && session.picks.b.length === 5;
 
-            if (bothPicksSubmitted) {
-                nextMovie(session, true);
-            } else if (session.picks[role].length === 5) {
-                // Allow voting to start for the ready player without waiting for the other picks.
-                nextMovie(session, false);
+            if (session.picks.a.length === 5 && session.picks.b.length === 5) {
+                nextMovie(session);
             } else {
-                session.phase = bothUsersConnected ? "picking" : "waiting_for_second_user";
-                session.currentMovie = null;
-                session.votes = { a: null, b: null };
+                session.phase = "picking";
             }
 
             broadcastState(session);
@@ -261,8 +248,7 @@ wss.on("connection", (socket) => {
                     if (session.currentMovie?.ID) {
                         session.seenMovieIds.add(session.currentMovie.ID);
                     }
-                    const bothPicksSubmitted = session.picks.a.length === 5 && session.picks.b.length === 5;
-                    nextMovie(session, bothPicksSubmitted);
+                    nextMovie(session);
 
                     outcomeText = session.phase === "finished_no_match"
                         ? "Kein Match und keine weiteren Titel verfügbar."
