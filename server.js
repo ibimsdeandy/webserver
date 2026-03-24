@@ -20,6 +20,7 @@ const getSessionState = (session) => ({
     code: session.code,
     phase: session.phase,
     currentMovie: session.currentMovie,
+    upcomingMovie: session.upcomingMovie,
     matchedMovie: session.matchedMovie,
     moviePool: [...session.picks.a, ...session.picks.b]
         .reduce((acc, movie) => {
@@ -77,11 +78,20 @@ const nextMovie = (session) => {
     if (!pool.length) {
         session.phase = "finished_no_match";
         session.currentMovie = null;
+        session.upcomingMovie = null;
         return;
     }
 
-    const randomIndex = Math.floor(Math.random() * pool.length);
-    session.currentMovie = pool[randomIndex];
+    const preferredUpcoming = session.upcomingMovie
+        ? pool.find((movie) => movie.ID === session.upcomingMovie.ID)
+        : null;
+    const current = preferredUpcoming ?? pool[Math.floor(Math.random() * pool.length)];
+    session.currentMovie = current;
+
+    const remaining = pool.filter((movie) => movie.ID !== current.ID);
+    session.upcomingMovie = remaining.length > 0
+        ? remaining[Math.floor(Math.random() * remaining.length)]
+        : null;
     session.phase = "voting";
     session.votes = { a: null, b: null };
 };
@@ -168,6 +178,7 @@ wss.on("connection", (socket) => {
                 picks: { a: [], b: [] },
                 votes: { a: null, b: null },
                 currentMovie: null,
+                upcomingMovie: null,
                 matchedMovie: null,
                 seenMovieIds: new Set(),
                 chatMessages: [],
@@ -248,6 +259,7 @@ wss.on("connection", (socket) => {
                 if (session.votes.a === "yes" && session.votes.b === "yes") {
                     session.phase = "matched";
                     session.matchedMovie = session.currentMovie;
+                    session.upcomingMovie = null;
                     outcomeText = "Match!";
                 } else {
                     if (session.currentMovie?.ID) {
