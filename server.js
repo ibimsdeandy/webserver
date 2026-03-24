@@ -5,9 +5,11 @@ const { WebSocketServer } = require("ws");
 const PORT = Number(process.env.PORT || 3001);
 const sessions = new Map();
 
-const createCode = () => crypto.randomBytes(3).toString("hex").toUpperCase();
+const SESSION_CODE_LENGTH = 6;
+const createCode = () => String(crypto.randomInt(0, 10 ** SESSION_CODE_LENGTH)).padStart(SESSION_CODE_LENGTH, "0");
 const createMessageId = () => crypto.randomBytes(8).toString("hex");
 const toVoteLabel = (vote) => (vote === "yes" ? "Ja" : "Nein");
+const normalizeCode = (value) => String(value || "").replace(/\D/g, "").trim();
 
 const send = (socket, type, payload = {}) => {
     if (!socket || socket.readyState !== socket.OPEN) return;
@@ -148,7 +150,10 @@ wss.on("connection", (socket) => {
 
         if (type === "create_session") {
             detachSocketFromCurrentSession(socket);
-            const code = createCode();
+            let code = createCode();
+            while (sessions.has(code)) {
+                code = createCode();
+            }
             const session = {
                 code,
                 phase: "waiting_for_second_user",
@@ -171,7 +176,7 @@ wss.on("connection", (socket) => {
 
         if (type === "join_session") {
             detachSocketFromCurrentSession(socket);
-            const code = String(payload.code || "").trim().toUpperCase();
+            const code = normalizeCode(payload.code);
             const session = sessions.get(code);
 
             if (!session) {
@@ -197,7 +202,7 @@ wss.on("connection", (socket) => {
         }
 
         if (type === "submit_picks") {
-            const code = String(payload.code || "").trim().toUpperCase();
+            const code = normalizeCode(payload.code);
             const role = payload.role;
             const session = sessions.get(code);
 
@@ -216,7 +221,7 @@ wss.on("connection", (socket) => {
         }
 
         if (type === "vote_movie") {
-            const code = String(payload.code || "").trim().toUpperCase();
+            const code = normalizeCode(payload.code);
             const role = payload.role;
             const vote = payload.vote;
             const session = sessions.get(code);
@@ -262,7 +267,7 @@ wss.on("connection", (socket) => {
         }
 
         if (type === "send_chat_message") {
-            const code = String(payload.code || "").trim().toUpperCase();
+            const code = normalizeCode(payload.code);
             const role = payload.role;
             const text = String(payload.text || "").trim();
             const session = sessions.get(code);
