@@ -184,7 +184,7 @@ wss.on("connection", (socket) => {
 
             sessions.set(code, session);
             socket.meta = { code, role: roles[0] };
-            send(socket, "session_created", { code, role: roles[0] });
+            send(socket, "session_created", { code, role: roles[0], participantCount, pickCount });
             send(socket, "chat_history", session.chatMessages);
             broadcastState(session);
             return;
@@ -215,7 +215,12 @@ wss.on("connection", (socket) => {
                 nextMovie(session);
             }
 
-            send(socket, "session_joined", { code, role });
+            send(socket, "session_joined", {
+                code,
+                role,
+                participantCount: session.participantCount,
+                pickCount: session.pickCount,
+            });
             send(socket, "chat_history", session.chatMessages);
             broadcastState(session);
             return;
