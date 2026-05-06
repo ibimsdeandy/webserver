@@ -1,11 +1,26 @@
+const http = require("http");
 const { WebSocketServer } = require("ws");
 const crypto = require("crypto");
-const { createLogger } = require("./logger");
+//const { createLogger } = require("./logger");
 
-const logger = createLogger("watchMatchServer");
+//const logger = createLogger("watchMatchServer");
 
 const PORT = Number(process.env.WATCH_MATCH_PORT || 3001);
-const wss = new WebSocketServer({ port: PORT });
+const server = http.createServer((req, res) => {
+    const host = req.headers.host || `localhost:${PORT}`;
+    const body = JSON.stringify({
+        ok: true,
+        service: "watch-match",
+        websocketUrl: `ws://${host}`,
+    }, null, 2);
+
+    res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+    });
+    res.end(`${body}\n`);
+});
+const wss = new WebSocketServer({ server });
 
 const sessions = new Map();
 
@@ -16,6 +31,8 @@ const DEFAULT_PARTICIPANTS = 2;
 const MIN_PICK_COUNT = 1;
 const MAX_PICK_COUNT = 150;
 const DEFAULT_PICK_COUNT = 5;
+const DEFAULT_MODE = "watch_now";
+const SESSION_MODES = new Set(["watch_now", "later"]);
 const ROLE_NAMES = Array.from({ length: MAX_PARTICIPANTS }, (_, index) => String.fromCharCode(97 + index));
 
 const toId = () => String(crypto.randomInt(0, 10 ** SESSION_CODE_LENGTH)).padStart(SESSION_CODE_LENGTH, "0");
@@ -45,16 +62,32 @@ const allVotesDone = (session) => session.roles.every((role) => Boolean(session.
 const resetVotes = (session) => {
     session.votes = createRoleMap(session, () => null);
 };
+const isHost = (session, role) => role === session.roles[0];
+const getMode = (value) => SESSION_MODES.has(value) ? value : DEFAULT_MODE;
+const sanitizeProviderIds = (value) => Array.isArray(value)
+    ? value.map((id) => String(id).replace(/[^\d]/g, "").trim()).filter(Boolean)
+    : [];
+const finishVoting = (session) => {
+    session.phase = session.mode === "later" && session.matchedMovies.length > 0
+        ? "finished_with_matches"
+        : "finished_no_match";
+    session.currentMovie = null;
+    session.upcomingMovie = null;
+};
 
 const broadcastState = (session) => {
     const payload = {
         code: session.code,
         participantCount: session.participantCount,
         pickCount: session.pickCount,
+        mode: session.mode,
+        hostRole: session.roles[0],
+        selectedProviderIds: session.selectedProviderIds,
         phase: session.phase,
         currentMovie: session.currentMovie,
         upcomingMovie: session.upcomingMovie,
         matchedMovie: session.matchedMovie,
+        matchedMovies: session.matchedMovies,
         moviePool: session.roles
             .flatMap((role) => session.picks[role])
             .reduce((acc, movie) => {
@@ -99,9 +132,7 @@ const getPool = (session) => {
 const nextMovie = (session) => {
     const pool = getPool(session);
     if (!pool.length) {
-        session.phase = "finished_no_match";
-        session.currentMovie = null;
-        session.upcomingMovie = null;
+        finishVoting(session);
         return;
     }
 
@@ -165,26 +196,30 @@ wss.on("connection", (socket) => {
                 DEFAULT_PARTICIPANTS
             );
             const pickCount = clampInteger(payload.pickCount, MIN_PICK_COUNT, MAX_PICK_COUNT, DEFAULT_PICK_COUNT);
+            const mode = getMode(payload.mode);
             const roles = ROLE_NAMES.slice(0, participantCount);
             const session = {
                 code,
                 participantCount,
                 pickCount,
+                mode,
                 roles,
-                phase: participantCount === 1 ? "picking" : "waiting_for_second_user",
+                phase: "configuring_providers",
+                selectedProviderIds: [],
                 players: createRoleMap({ roles }, (role) => role === roles[0] ? socket : null),
                 picks: createRoleMap({ roles }, () => []),
                 votes: createRoleMap({ roles }, () => null),
                 currentMovie: null,
                 upcomingMovie: null,
                 matchedMovie: null,
+                matchedMovies: [],
                 seenMovieIds: new Set(),
                 chatMessages: [],
             };
 
             sessions.set(code, session);
             socket.meta = { code, role: roles[0] };
-            send(socket, "session_created", { code, role: roles[0], participantCount, pickCount });
+            send(socket, "session_created", { code, role: roles[0], participantCount, pickCount, mode });
             send(socket, "chat_history", session.chatMessages);
             broadcastState(session);
             return;
@@ -208,7 +243,7 @@ wss.on("connection", (socket) => {
 
             session.players[role] = socket;
             socket.meta = { code, role };
-            if (session.phase === "waiting_for_second_user" && allPlayersConnected(session)) {
+            if (session.phase === "waiting_for_second_user" && session.selectedProviderIds.length > 0 && allPlayersConnected(session)) {
                 session.phase = "picking";
             }
             if ((session.phase === "waiting_for_second_user" || session.phase === "picking") && allPlayersConnected(session) && allPicksDone(session)) {
@@ -220,8 +255,35 @@ wss.on("connection", (socket) => {
                 role,
                 participantCount: session.participantCount,
                 pickCount: session.pickCount,
+                mode: session.mode,
             });
             send(socket, "chat_history", session.chatMessages);
+            broadcastState(session);
+            return;
+        }
+
+        if (type === "submit_provider_setup") {
+            const code = String(payload.code || "").replace(/\D/g, "").trim();
+            const role = payload.role;
+            const providerIds = sanitizeProviderIds(payload.providerIds);
+            const session = sessions.get(code);
+
+            if (!session || !session.roles.includes(role)) return;
+            if (session.players[role] !== socket) return;
+            if (!isHost(session, role)) {
+                send(socket, "session_error", { message: "Only the host can select providers" });
+                return;
+            }
+            if (!providerIds.length) {
+                send(socket, "session_error", { message: "Please select at least one provider" });
+                return;
+            }
+
+            session.selectedProviderIds = providerIds;
+            session.phase = allPlayersConnected(session) ? "picking" : "waiting_for_second_user";
+            if (allPlayersConnected(session) && allPicksDone(session)) {
+                nextMovie(session);
+            }
             broadcastState(session);
             return;
         }
@@ -235,15 +297,21 @@ wss.on("connection", (socket) => {
             if (!session || !session.roles.includes(role)) return;
             if (session.players[role] !== socket) return;
 
-            session.picks[role] = movies.slice(0, session.pickCount).map((movie) => ({
-                ID: Number(movie.ID),
-                Title: String(movie.Title || "Unknown"),
-                PosterUrl: movie.PosterUrl || undefined,
-                Character: movie.Character || undefined,
-                Year: movie.Year || undefined,
-                Type: movie.Type || undefined,
-                AvailabilityStatus: movie.AvailabilityStatus || undefined,
-            }));
+            if (session.phase !== "picking" && session.phase !== "waiting_for_second_user") return;
+            if (!session.selectedProviderIds.length) return;
+
+            session.picks[role] = movies
+                .filter((movie) => String(movie.Type || "Movie") === "Movie")
+                .slice(0, session.pickCount)
+                .map((movie) => ({
+                    ID: Number(movie.ID),
+                    Title: String(movie.Title || "Unknown"),
+                    PosterUrl: movie.PosterUrl || undefined,
+                    Character: movie.Character || undefined,
+                    Year: movie.Year || undefined,
+                    Type: movie.Type || undefined,
+                    AvailabilityStatus: movie.AvailabilityStatus || undefined,
+                }));
 
             if (allPlayersConnected(session) && allPicksDone(session)) {
                 nextMovie(session);
@@ -271,13 +339,19 @@ wss.on("connection", (socket) => {
             session.votes[role] = vote;
 
             if (allVotesDone(session)) {
-                if (session.roles.every((candidate) => session.votes[candidate] === "yes")) {
+                const currentMovie = session.currentMovie;
+                const isMatch = session.roles.every((candidate) => session.votes[candidate] === "yes");
+
+                if (isMatch && session.mode === "watch_now") {
                     session.phase = "matched";
-                    session.matchedMovie = session.currentMovie;
+                    session.matchedMovie = currentMovie;
                     session.upcomingMovie = null;
                 } else {
-                    if (session.currentMovie?.ID) {
-                        session.seenMovieIds.add(session.currentMovie.ID);
+                    if (isMatch && currentMovie && !session.matchedMovies.some((movie) => movie.ID === currentMovie.ID)) {
+                        session.matchedMovies.push(currentMovie);
+                    }
+                    if (currentMovie?.ID) {
+                        session.seenMovieIds.add(currentMovie.ID);
                     }
                     nextMovie(session);
                 }
@@ -328,4 +402,6 @@ wss.on("connection", (socket) => {
     });
 });
 
-logger.info(`[watch-match] server listening on :${PORT}`);
+server.listen(PORT, () => {
+    //logger.info(`[watch-match] server listening on :${PORT}`);
+});
