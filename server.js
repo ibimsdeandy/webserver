@@ -307,6 +307,7 @@ wss.on("connection", (socket) => {
                     ID: Number(movie.ID),
                     Title: String(movie.Title || "Unknown"),
                     PosterUrl: movie.PosterUrl || undefined,
+                    BackgroundImageUrl: movie.BackgroundImageUrl || movie.BackdropUrl || movie.Backdrop || undefined,
                     Character: movie.Character || undefined,
                     Year: movie.Year || undefined,
                     Type: movie.Type || undefined,
