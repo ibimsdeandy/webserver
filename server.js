@@ -1,16 +1,18 @@
 const http = require("http");
-const { WebSocketServer } = require("ws");
+const {WebSocketServer} = require("ws");
 const crypto = require("crypto");
-//const { createLogger } = require("./logger");
 
-//const logger = createLogger("watchMatchServer");
+const PORT = Number(process.env.MOVIE_MATCH_PORT || 3002);
+const SESSION_CODE_LENGTH = 6;
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_SOURCE_MOVIES = 500;
+const SOURCE_MODES = new Set(["suggestions", "lists"]);
 
-const PORT = Number(process.env.WATCH_MATCH_PORT || 3001);
 const server = http.createServer((req, res) => {
     const host = req.headers.host || `localhost:${PORT}`;
     const body = JSON.stringify({
         ok: true,
-        service: "watch-match",
+        service: "movie-match",
         websocketUrl: `ws://${host}`,
     }, null, 2);
 
@@ -20,35 +22,61 @@ const server = http.createServer((req, res) => {
     });
     res.end(`${body}\n`);
 });
-const wss = new WebSocketServer({ server });
 
+const wss = new WebSocketServer({server});
 const sessions = new Map();
-
-const SESSION_CODE_LENGTH = 6;
-const MIN_PARTICIPANTS = 1;
-const MAX_PARTICIPANTS = 10;
-const DEFAULT_PARTICIPANTS = 2;
-const MIN_PICK_COUNT = 1;
-const MAX_PICK_COUNT = 150;
-const DEFAULT_PICK_COUNT = 5;
-const DEFAULT_MODE = "watch_now";
-const SESSION_MODES = new Set(["watch_now", "later"]);
-const ROLE_NAMES = Array.from({ length: MAX_PARTICIPANTS }, (_, index) => String.fromCharCode(97 + index));
 
 const toId = () => String(crypto.randomInt(0, 10 ** SESSION_CODE_LENGTH)).padStart(SESSION_CODE_LENGTH, "0");
 const toMessageId = () => crypto.randomBytes(8).toString("hex");
-const clampInteger = (value, min, max, fallback) => {
-    const numeric = Number(value);
-    if (!Number.isFinite(numeric)) return fallback;
-    return Math.max(min, Math.min(max, Math.round(numeric)));
+
+const now = () => Date.now();
+
+const sendRaw = (socket, message) => {
+    if (socket.readyState !== socket.OPEN) return;
+    socket.send(message);
 };
 
 const send = (socket, type, payload = {}) => {
-    if (socket.readyState !== socket.OPEN) return;
-    socket.send(JSON.stringify({ type, payload }));
+    sendRaw(socket, JSON.stringify({type, payload}));
 };
 
-const getSessionSockets = (session) => session.roles
+const createRoleId = (session) => {
+    session.nextRoleNumber += 1;
+    return `u${session.nextRoleNumber}`;
+};
+
+const getSourceMode = (value) => SOURCE_MODES.has(value) ? value : "suggestions";
+
+const sanitizeProviderIds = (value) => Array.isArray(value)
+    ? value.map((id) => String(id).replace(/[^\d]/g, "").trim()).filter(Boolean)
+    : [];
+
+const sanitizeMovies = (movies) => {
+    const uniqueMovies = new Map();
+
+    (Array.isArray(movies) ? movies : []).forEach((movie) => {
+        const id = Number(movie?.ID);
+        if (!Number.isFinite(id)) return;
+        if (String(movie?.Type || "Movie") !== "Movie") return;
+        if (uniqueMovies.has(id)) return;
+
+        uniqueMovies.set(id, {
+            ID: id,
+            Title: String(movie?.Title || "Unknown"),
+            PosterUrl: movie?.PosterUrl || undefined,
+            BackgroundImageUrl: movie?.BackgroundImageUrl || movie?.BackdropUrl || movie?.Backdrop || undefined,
+            Character: movie?.Character || undefined,
+            Year: movie?.Year || undefined,
+            Type: movie?.Type || undefined,
+            AvailabilityStatus: movie?.AvailabilityStatus || undefined,
+        });
+    });
+
+    return Array.from(uniqueMovies.values()).slice(0, MAX_SOURCE_MOVIES);
+};
+
+const getConnectedRoles = (session) => session.roles.filter((role) => Boolean(session.players[role]));
+const getConnectedSockets = (session) => getConnectedRoles(session)
     .map((role) => session.players[role])
     .filter(Boolean);
 
@@ -56,50 +84,183 @@ const createRoleMap = (session, getValue) => Object.fromEntries(
     session.roles.map((role) => [role, getValue(role)])
 );
 
-const allPlayersConnected = (session) => session.roles.every((role) => Boolean(session.players[role]));
-const allPicksDone = (session) => session.roles.every((role) => session.picks[role].length === session.pickCount);
-const allVotesDone = (session) => session.roles.every((role) => Boolean(session.votes[role]));
-const resetVotes = (session) => {
-    session.votes = createRoleMap(session, () => null);
+const getRoleProgress = (session, role) => {
+    const progress = Number(session.progressByRole?.[role]);
+    return Number.isInteger(progress) && progress >= 0 ? progress : 0;
 };
-const isHost = (session, role) => role === session.roles[0];
-const getMode = (value) => SESSION_MODES.has(value) ? value : DEFAULT_MODE;
-const sanitizeProviderIds = (value) => Array.isArray(value)
-    ? value.map((id) => String(id).replace(/[^\d]/g, "").trim()).filter(Boolean)
+
+const getRoleCurrentMovie = (session, role) => session.moviePool[getRoleProgress(session, role)] ?? null;
+const getRoleUpcomingMovie = (session, role) => session.moviePool[getRoleProgress(session, role) + 1] ?? null;
+const hasRemainingMoviesForRole = (session, role) => Boolean(getRoleCurrentMovie(session, role));
+const hasRemainingMoviesForAnyConnectedRole = (session) => getConnectedRoles(session)
+    .some((role) => hasRemainingMoviesForRole(session, role));
+
+const getMovieVotes = (session, movieId) => {
+    const key = String(movieId);
+    if (!session.movieVotes[key]) {
+        session.movieVotes[key] = {};
+    }
+
+    return session.movieVotes[key];
+};
+
+const peekMovieVotes = (session, movieId) => session.movieVotes[String(movieId)] ?? {};
+
+const getUnlockedMatchedMovieIdsForRole = (session, role) => Array.isArray(session.unlockedMatchedMovieIdsByRole?.[role])
+    ? session.unlockedMatchedMovieIdsByRole[role]
     : [];
-const finishVoting = (session) => {
-    session.phase = session.mode === "later" && session.matchedMovies.length > 0
-        ? "finished_with_matches"
+
+const getHiddenMatchedMovieIdsForRole = (session, role) => Array.isArray(session.hiddenMatchedMovieIdsByRole?.[role])
+    ? session.hiddenMatchedMovieIdsByRole[role]
+    : [];
+
+const unlockMatchedMovieForRole = (session, role, movieId) => {
+    if (!role || !movieId) return;
+
+    if (!Array.isArray(session.unlockedMatchedMovieIdsByRole?.[role])) {
+        session.unlockedMatchedMovieIdsByRole[role] = [];
+    }
+
+    if (session.unlockedMatchedMovieIdsByRole[role].includes(movieId)) return;
+    session.unlockedMatchedMovieIdsByRole[role].push(movieId);
+};
+
+const hideMatchedMovieForRole = (session, role, movieId) => {
+    if (!role || !movieId) return;
+
+    if (!Array.isArray(session.hiddenMatchedMovieIdsByRole?.[role])) {
+        session.hiddenMatchedMovieIdsByRole[role] = [];
+    }
+
+    if (session.hiddenMatchedMovieIdsByRole[role].includes(movieId)) return;
+    session.hiddenMatchedMovieIdsByRole[role].push(movieId);
+};
+
+const persistMatchedMovieUnlocks = (session, movie) => {
+    if (!movie?.ID) return;
+
+    const connectedRoles = getConnectedRoles(session);
+    connectedRoles.forEach((role) => {
+        if (peekMovieVotes(session, movie.ID)[role] === "yes") {
+            unlockMatchedMovieForRole(session, role, movie.ID);
+        }
+    });
+};
+
+const pushHostSoloMatchedMovie = (session, movie) => {
+    if (!movie?.ID) return;
+
+    const connectedRoles = getConnectedRoles(session);
+    if (connectedRoles.length !== 1) return;
+    if (connectedRoles[0] !== session.hostRole) return;
+    if (session.hostSoloMatchedMovieIds.includes(movie.ID)) return;
+
+    session.hostSoloMatchedMovieIds.push(movie.ID);
+};
+
+const pushMatchedMovie = (session, movie) => {
+    if (!movie) return;
+    if (session.matchedMovies.some((entry) => entry.ID === movie.ID)) return;
+    session.matchedMovies.push(movie);
+    pushHostSoloMatchedMovie(session, movie);
+};
+
+const hasMatchedMovie = (session, movieId) => session.matchedMovies
+    .some((entry) => Number(entry?.ID) === Number(movieId));
+
+const findPendingMatchedMovie = (session) => {
+    const connectedRoles = getConnectedRoles(session);
+    if (!connectedRoles.length) return null;
+
+    return session.moviePool.find((movie) => {
+        if (!movie?.ID) return false;
+        if (session.dismissedMatchMovieIds.has(movie.ID)) return false;
+
+        const votes = peekMovieVotes(session, movie.ID);
+        return connectedRoles.length > 0 && connectedRoles.every((role) => votes[role] === "yes");
+    }) ?? null;
+};
+
+const syncSessionPhase = (session, options = {}) => {
+    const allowPendingMatch = options.allowPendingMatch !== false;
+    const activeMatchedMovie = session.matchedMovie && !session.dismissedMatchMovieIds.has(session.matchedMovie.ID)
+        ? session.matchedMovie
+        : null;
+    const pendingMatchedMovie = activeMatchedMovie ?? (allowPendingMatch ? findPendingMatchedMovie(session) : null);
+
+    session.matchedMovie = pendingMatchedMovie;
+    if (pendingMatchedMovie) {
+        pushMatchedMovie(session, pendingMatchedMovie);
+        persistMatchedMovieUnlocks(session, pendingMatchedMovie);
+        session.phase = "match_prompt";
+        return;
+    }
+
+    session.phase = hasRemainingMoviesForAnyConnectedRole(session)
+        ? "voting"
         : "finished_no_match";
-    session.currentMovie = null;
-    session.upcomingMovie = null;
+};
+
+const createVoteStatsByRole = (session) => createRoleMap(session, (role) => {
+    let yes = 0;
+    let no = 0;
+
+    Object.values(session.movieVotes).forEach((votes) => {
+        if (votes?.[role] === "yes") yes += 1;
+        if (votes?.[role] === "no") no += 1;
+    });
+
+    const total = yes + no;
+
+    return {
+        yes,
+        no,
+        total,
+        yesRatio: total > 0 ? yes / total : 0,
+        noRatio: total > 0 ? no / total : 0,
+    };
+});
+
+const broadcastToSession = (session, type, payload = {}, options = {}) => {
+    const message = JSON.stringify({type, payload});
+    const excludedRoles = new Set(Array.isArray(options.excludeRoles) ? options.excludeRoles : []);
+
+    getConnectedRoles(session)
+        .filter((role) => !excludedRoles.has(role))
+        .map((role) => session.players[role])
+        .filter(Boolean)
+        .forEach((socket) => sendRaw(socket, message));
+};
+
+const markSessionTouched = (session) => {
+    session.updatedAt = now();
 };
 
 const broadcastState = (session) => {
-    const payload = {
+    markSessionTouched(session);
+    broadcastToSession(session, "session_state", {
         code: session.code,
-        participantCount: session.participantCount,
-        pickCount: session.pickCount,
-        mode: session.mode,
-        hostRole: session.roles[0],
-        selectedProviderIds: session.selectedProviderIds,
+        hostRole: session.hostRole,
+        sourceMode: session.sourceMode,
         phase: session.phase,
-        currentMovie: session.currentMovie,
-        upcomingMovie: session.upcomingMovie,
+        sourceVersion: session.sourceVersion,
+        filterUrl: session.filterUrl,
+        selectedListId: session.selectedListId,
+        selectedProviderIds: session.selectedProviderIds,
+        currentMovie: getRoleCurrentMovie(session, session.hostRole),
+        upcomingMovie: getRoleUpcomingMovie(session, session.hostRole),
+        currentMovieByRole: createRoleMap(session, (role) => getRoleCurrentMovie(session, role)),
+        upcomingMovieByRole: createRoleMap(session, (role) => getRoleUpcomingMovie(session, role)),
         matchedMovie: session.matchedMovie,
         matchedMovies: session.matchedMovies,
-        moviePool: session.roles
-            .flatMap((role) => session.picks[role])
-            .reduce((acc, movie) => {
-                if (!acc.some((item) => item.ID === movie.ID)) acc.push(movie);
-                return acc;
-            }, []),
-        picksDone: createRoleMap(session, (role) => session.picks[role].length === session.pickCount),
+        unlockedMatchedMovieIdsByRole: createRoleMap(session, (role) => getUnlockedMatchedMovieIdsForRole(session, role)),
+        hiddenMatchedMovieIdsByRole: createRoleMap(session, (role) => getHiddenMatchedMovieIdsForRole(session, role)),
+        hostSoloMatchedMovieIds: session.hostSoloMatchedMovieIds,
+        voteStatsByRole: createVoteStatsByRole(session),
+        moviePool: session.moviePool,
+        votesDone: createRoleMap(session, () => false),
         usersReady: createRoleMap(session, (role) => Boolean(session.players[role])),
-        votesDone: createRoleMap(session, (role) => Boolean(session.votes[role])),
-    };
-
-    getSessionSockets(session).forEach((ws) => send(ws, "session_state", payload));
+    });
 };
 
 const createChatMessage = (role, text) => ({
@@ -109,49 +270,81 @@ const createChatMessage = (role, text) => ({
     createdAt: new Date().toISOString(),
 });
 
-const pushChatMessage = (session, message) => {
+const pushChatMessage = (session, message, options = {}) => {
     session.chatMessages.push(message);
     if (session.chatMessages.length > 100) {
         session.chatMessages.shift();
     }
 
-    getSessionSockets(session).forEach((ws) => send(ws, "chat_message", message));
+    broadcastToSession(session, "chat_message", message, options);
 };
 
-const getPool = (session) => {
-    const deduped = new Map();
-    session.roles
-        .flatMap((role) => session.picks[role])
-        .forEach((movie) => {
-            if (!deduped.has(movie.ID)) deduped.set(movie.ID, movie);
-        });
-
-    return Array.from(deduped.values()).filter((movie) => !session.seenMovieIds.has(movie.ID));
-};
-
-const nextMovie = (session) => {
-    const pool = getPool(session);
-    if (!pool.length) {
-        finishVoting(session);
-        return;
+const createSession = (socket, options = {}) => {
+    const sourceMode = getSourceMode(options.sourceMode);
+    const initialMovies = sanitizeMovies(options.movies);
+    const initialFilterUrl = typeof options.filterUrl === "string" && options.filterUrl.trim()
+        ? options.filterUrl.trim()
+        : null;
+    const initialSelectedListId = options.selectedListId ? String(options.selectedListId) : null;
+    const initialSelectedProviderIds = sanitizeProviderIds(options.selectedProviderIds);
+    let code = toId();
+    while (sessions.has(code)) {
+        code = toId();
     }
 
-    const preferredUpcoming = session.upcomingMovie
-        ? pool.find((movie) => movie.ID === session.upcomingMovie.ID)
-        : null;
-    const current = preferredUpcoming ?? pool[Math.floor(Math.random() * pool.length)];
-    session.currentMovie = current;
+    const hostRole = "u1";
+    const session = {
+        code,
+        hostRole,
+        sourceMode,
+        sourceVersion: initialMovies.length > 0 ? 1 : 0,
+        phase: initialMovies.length > 0 ? "voting" : "loading_source",
+        filterUrl: initialFilterUrl,
+        selectedListId: initialSelectedListId,
+        selectedProviderIds: initialSelectedProviderIds,
+        currentMovie: null,
+        upcomingMovie: null,
+        matchedMovie: null,
+        matchedMovies: [],
+        unlockedMatchedMovieIdsByRole: {[hostRole]: []},
+        hiddenMatchedMovieIdsByRole: {[hostRole]: []},
+        hostSoloMatchedMovieIds: [],
+        moviePool: initialMovies,
+        roles: [hostRole],
+        nextRoleNumber: 1,
+        players: {[hostRole]: socket},
+        progressByRole: {[hostRole]: 0},
+        movieVotes: {},
+        dismissedMatchMovieIds: new Set(),
+        chatMessages: [],
+        updatedAt: now(),
+    };
 
-    const remaining = pool.filter((movie) => movie.ID !== current.ID);
-    session.upcomingMovie = remaining.length > 0
-        ? remaining[Math.floor(Math.random() * remaining.length)]
-        : null;
-    session.phase = "voting";
-    resetVotes(session);
+    sessions.set(code, session);
+    socket.meta = {code, role: hostRole};
+
+    syncSessionPhase(session);
+
+    send(socket, "session_created", {code, role: hostRole, sourceMode});
+    send(socket, "chat_history", session.chatMessages);
+    broadcastState(session);
 };
 
+const cleanupExpiredSessions = () => {
+    const expiryThreshold = now() - SESSION_TTL_MS;
+
+    sessions.forEach((session, code) => {
+        const hasConnectedPlayers = getConnectedRoles(session).length > 0;
+        if (hasConnectedPlayers) return;
+        if (session.updatedAt >= expiryThreshold) return;
+        sessions.delete(code);
+    });
+};
+
+setInterval(cleanupExpiredSessions, 10 * 60 * 1000).unref();
+
 const detachSocketFromCurrentSession = (socket) => {
-    const { code, role } = socket.meta || {};
+    const {code, role} = socket.meta || {};
     if (!code || !role) return;
 
     const session = sessions.get(code);
@@ -161,67 +354,32 @@ const detachSocketFromCurrentSession = (socket) => {
         session.players[role] = null;
     }
 
-    if (!getSessionSockets(session).length) {
-        sessions.delete(code);
-    } else {
-        broadcastState(session);
-    }
+    syncSessionPhase(session, {allowPendingMatch: false});
+    broadcastState(session);
 };
 
 wss.on("connection", (socket) => {
-    socket.meta = { code: null, role: null };
+    socket.meta = {code: null, role: null};
 
     socket.on("message", (raw) => {
         let message;
         try {
             message = JSON.parse(String(raw));
         } catch {
-            send(socket, "session_error", { message: "Invalid payload" });
+            send(socket, "session_error", {message: "Invalid payload"});
             return;
         }
 
-        const { type, payload = {} } = message;
+        const {type, payload = {}} = message;
+
+        if (type === "ping") {
+            send(socket, "pong", {ts: Date.now()});
+            return;
+        }
 
         if (type === "create_session") {
             detachSocketFromCurrentSession(socket);
-            let code = toId();
-            while (sessions.has(code)) {
-                code = toId();
-            }
-
-            const participantCount = clampInteger(
-                payload.participantCount,
-                MIN_PARTICIPANTS,
-                MAX_PARTICIPANTS,
-                DEFAULT_PARTICIPANTS
-            );
-            const pickCount = clampInteger(payload.pickCount, MIN_PICK_COUNT, MAX_PICK_COUNT, DEFAULT_PICK_COUNT);
-            const mode = getMode(payload.mode);
-            const roles = ROLE_NAMES.slice(0, participantCount);
-            const session = {
-                code,
-                participantCount,
-                pickCount,
-                mode,
-                roles,
-                phase: "configuring_providers",
-                selectedProviderIds: [],
-                players: createRoleMap({ roles }, (role) => role === roles[0] ? socket : null),
-                picks: createRoleMap({ roles }, () => []),
-                votes: createRoleMap({ roles }, () => null),
-                currentMovie: null,
-                upcomingMovie: null,
-                matchedMovie: null,
-                matchedMovies: [],
-                seenMovieIds: new Set(),
-                chatMessages: [],
-            };
-
-            sessions.set(code, session);
-            socket.meta = { code, role: roles[0] };
-            send(socket, "session_created", { code, role: roles[0], participantCount, pickCount, mode });
-            send(socket, "chat_history", session.chatMessages);
-            broadcastState(session);
+            createSession(socket, payload);
             return;
         }
 
@@ -231,140 +389,162 @@ wss.on("connection", (socket) => {
             const session = sessions.get(code);
 
             if (!session) {
-                send(socket, "session_error", { message: "Session not found" });
+                send(socket, "session_error", {message: "Session not found"});
                 return;
             }
 
-            const role = session.roles.find((candidate) => !session.players[candidate]);
-            if (!role) {
-                send(socket, "session_error", { message: "Session is full" });
-                return;
-            }
-
+            const role = createRoleId(session);
+            session.roles.push(role);
             session.players[role] = socket;
-            socket.meta = { code, role };
-            if (session.phase === "waiting_for_second_user" && session.selectedProviderIds.length > 0 && allPlayersConnected(session)) {
-                session.phase = "picking";
-            }
-            if ((session.phase === "waiting_for_second_user" || session.phase === "picking") && allPlayersConnected(session) && allPicksDone(session)) {
-                nextMovie(session);
-            }
+            session.progressByRole[role] = 0;
+            session.unlockedMatchedMovieIdsByRole[role] = [];
+            session.hiddenMatchedMovieIdsByRole[role] = [];
+            socket.meta = {code, role};
+            markSessionTouched(session);
 
             send(socket, "session_joined", {
                 code,
                 role,
-                participantCount: session.participantCount,
-                pickCount: session.pickCount,
-                mode: session.mode,
+                sourceMode: session.sourceMode,
             });
             send(socket, "chat_history", session.chatMessages);
+            syncSessionPhase(session);
             broadcastState(session);
             return;
         }
 
-        if (type === "submit_provider_setup") {
+        if (type === "rejoin_session") {
+            detachSocketFromCurrentSession(socket);
+
             const code = String(payload.code || "").replace(/\D/g, "").trim();
-            const role = payload.role;
-            const providerIds = sanitizeProviderIds(payload.providerIds);
+            const role = String(payload.role || "").trim();
             const session = sessions.get(code);
 
-            if (!session || !session.roles.includes(role)) return;
-            if (session.players[role] !== socket) return;
-            if (!isHost(session, role)) {
-                send(socket, "session_error", { message: "Only the host can select providers" });
-                return;
-            }
-            if (!providerIds.length) {
-                send(socket, "session_error", { message: "Please select at least one provider" });
+            if (!session) {
+                send(socket, "session_error", {message: "Session not found"});
                 return;
             }
 
-            session.selectedProviderIds = providerIds;
-            session.phase = allPlayersConnected(session) ? "picking" : "waiting_for_second_user";
-            if (allPlayersConnected(session) && allPicksDone(session)) {
-                nextMovie(session);
+            if (!session.roles.includes(role)) {
+                send(socket, "session_error", {message: "Invalid role for session"});
+                return;
             }
+
+            const currentSocketForRole = session.players[role];
+            if (currentSocketForRole && currentSocketForRole !== socket) {
+                send(socket, "session_error", {message: "Role is already connected"});
+                return;
+            }
+
+            session.players[role] = socket;
+            socket.meta = {code, role};
+            markSessionTouched(session);
+
+            send(socket, "session_rejoined", {
+                code,
+                role,
+                sourceMode: session.sourceMode,
+            });
+            send(socket, "chat_history", session.chatMessages);
+            syncSessionPhase(session);
             broadcastState(session);
             return;
         }
 
-        if (type === "submit_picks") {
+        if (type === "update_session_source") {
             const code = String(payload.code || "").replace(/\D/g, "").trim();
-            const role = payload.role;
-            const movies = Array.isArray(payload.movies) ? payload.movies : [];
+            const role = String(payload.role || "").trim();
             const session = sessions.get(code);
 
-            if (!session || !session.roles.includes(role)) return;
+            if (!session || session.hostRole !== role) return;
             if (session.players[role] !== socket) return;
 
-            if (session.phase !== "picking" && session.phase !== "waiting_for_second_user") return;
-            if (!session.selectedProviderIds.length) return;
+            const nextMovies = sanitizeMovies(payload.movies);
+            const nextSourceMode = getSourceMode(payload.sourceMode);
 
-            session.picks[role] = movies
-                .filter((movie) => String(movie.Type || "Movie") === "Movie")
-                .slice(0, session.pickCount)
-                .map((movie) => ({
-                    ID: Number(movie.ID),
-                    Title: String(movie.Title || "Unknown"),
-                    PosterUrl: movie.PosterUrl || undefined,
-                    BackgroundImageUrl: movie.BackgroundImageUrl || movie.BackdropUrl || movie.Backdrop || undefined,
-                    Character: movie.Character || undefined,
-                    Year: movie.Year || undefined,
-                    Type: movie.Type || undefined,
-                    AvailabilityStatus: movie.AvailabilityStatus || undefined,
-                }));
-
-            if (allPlayersConnected(session) && allPicksDone(session)) {
-                nextMovie(session);
-            } else if (allPlayersConnected(session)) {
-                session.phase = "picking";
-            } else {
-                session.phase = "waiting_for_second_user";
-            }
-
+            session.sourceMode = nextSourceMode;
+            session.filterUrl = typeof payload.filterUrl === "string" && payload.filterUrl.trim()
+                ? payload.filterUrl.trim()
+                : null;
+            session.selectedListId = payload.selectedListId ? String(payload.selectedListId) : null;
+            session.selectedProviderIds = sanitizeProviderIds(payload.selectedProviderIds);
+            session.moviePool = nextMovies;
+            session.matchedMovie = null;
+            session.currentMovie = null;
+            session.upcomingMovie = null;
+            session.progressByRole = createRoleMap(session, () => 0);
+            session.movieVotes = {};
+            session.dismissedMatchMovieIds = new Set();
+            session.hiddenMatchedMovieIdsByRole = createRoleMap(session, () => []);
+            session.sourceVersion += 1;
+            syncSessionPhase(session);
             broadcastState(session);
             return;
         }
 
         if (type === "vote_movie") {
             const code = String(payload.code || "").replace(/\D/g, "").trim();
-            const role = payload.role;
+            const role = String(payload.role || "").trim();
             const vote = payload.vote;
+            const movieId = Number(payload.movieId);
             const session = sessions.get(code);
 
             if (!session || session.phase !== "voting") return;
             if (!session.roles.includes(role)) return;
             if (session.players[role] !== socket) return;
             if (vote !== "yes" && vote !== "no") return;
+            if (!Number.isFinite(movieId)) return;
 
-            session.votes[role] = vote;
+            const currentMovie = getRoleCurrentMovie(session, role);
+            if (!currentMovie || currentMovie.ID !== movieId) return;
 
-            if (allVotesDone(session)) {
-                const currentMovie = session.currentMovie;
-                const isMatch = session.roles.every((candidate) => session.votes[candidate] === "yes");
-
-                if (isMatch && session.mode === "watch_now") {
-                    session.phase = "matched";
-                    session.matchedMovie = currentMovie;
-                    session.upcomingMovie = null;
-                } else {
-                    if (isMatch && currentMovie && !session.matchedMovies.some((movie) => movie.ID === currentMovie.ID)) {
-                        session.matchedMovies.push(currentMovie);
-                    }
-                    if (currentMovie?.ID) {
-                        session.seenMovieIds.add(currentMovie.ID);
-                    }
-                    nextMovie(session);
-                }
+            getMovieVotes(session, currentMovie.ID)[role] = vote;
+            if (vote === "yes" && hasMatchedMovie(session, currentMovie.ID)) {
+                unlockMatchedMovieForRole(session, role, currentMovie.ID);
             }
+            session.progressByRole[role] = getRoleProgress(session, role) + 1;
+            syncSessionPhase(session);
+            broadcastState(session);
+            return;
+        }
 
+        if (type === "continue_after_match") {
+            const code = String(payload.code || "").replace(/\D/g, "").trim();
+            const role = String(payload.role || "").trim();
+            const session = sessions.get(code);
+
+            if (!session || session.phase !== "match_prompt") return;
+            if (!session.roles.includes(role)) return;
+            if (session.players[role] !== socket) return;
+
+            if (session.matchedMovie?.ID) {
+                session.dismissedMatchMovieIds.add(session.matchedMovie.ID);
+            }
+            session.matchedMovie = null;
+            syncSessionPhase(session);
+            broadcastState(session);
+            return;
+        }
+
+        if (type === "dismiss_match_for_role") {
+            const code = String(payload.code || "").replace(/\D/g, "").trim();
+            const role = String(payload.role || "").trim();
+            const movieId = Number(payload.movieId);
+            const session = sessions.get(code);
+
+            if (!session || !session.roles.includes(role)) return;
+            if (session.players[role] !== socket) return;
+            if (!Number.isFinite(movieId)) return;
+
+            hideMatchedMovieForRole(session, role, movieId);
+            markSessionTouched(session);
             broadcastState(session);
             return;
         }
 
         if (type === "send_chat_message") {
             const code = String(payload.code || "").replace(/\D/g, "").trim();
-            const role = payload.role;
+            const role = String(payload.role || "").trim();
             const text = String(payload.text || "").trim();
             const session = sessions.get(code);
 
@@ -373,36 +553,44 @@ wss.on("connection", (socket) => {
             if (!text) return;
 
             pushChatMessage(session, createChatMessage(role, text));
+            markSessionTouched(session);
+            return;
+        }
+
+        if (type === "send_system_chat_message") {
+            const code = String(payload.code || "").replace(/\D/g, "").trim();
+            const role = String(payload.role || "").trim();
+            const text = String(payload.text || "").trim();
+            const excludeRole = typeof payload.excludeRole === "string" ? String(payload.excludeRole).trim() : "";
+            const session = sessions.get(code);
+
+            if (!session || session.hostRole !== role) return;
+            if (session.players[role] !== socket) return;
+            if (!text) return;
+
+            pushChatMessage(session, createChatMessage("system", text), {
+                excludeRoles: excludeRole ? [excludeRole] : [],
+            });
+            markSessionTouched(session);
             return;
         }
 
         if (type === "leave_session") {
             detachSocketFromCurrentSession(socket);
-            socket.meta = { code: null, role: null };
-            send(socket, "session_left", { ok: true });
+            socket.meta = {code: null, role: null};
+            send(socket, "session_left", {ok: true});
         }
     });
 
     socket.on("close", () => {
-        const { code, role } = socket.meta || {};
-        if (!code || !role) return;
+        detachSocketFromCurrentSession(socket);
+    });
 
-        const session = sessions.get(code);
-        if (!session) return;
-
-        if (session.players[role] === socket) {
-            session.players[role] = null;
-        }
-
-        if (!getSessionSockets(session).length) {
-            sessions.delete(code);
-            return;
-        }
-
-        broadcastState(session);
+    socket.on("error", () => {
+        detachSocketFromCurrentSession(socket);
     });
 });
 
 server.listen(PORT, () => {
-    //logger.info(`[watch-match] server listening on :${PORT}`);
+    console.log(`[movie-match] server listening on http://localhost:${PORT}`);
 });
